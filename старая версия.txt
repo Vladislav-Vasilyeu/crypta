@@ -1,0 +1,139 @@
+import random
+import time
+from mnemonic import Mnemonic
+from bitcoinlib.keys import HDKey
+import requests
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+# Настройка логирования
+error_logger = logging.getLogger('error_logger')
+error_handler = logging.FileHandler('errors.log')
+error_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+error_logger.addHandler(error_handler)
+error_logger.setLevel(logging.ERROR)
+
+balance_logger = logging.getLogger('balance_logger')
+balance_handler = logging.FileHandler('wallets_with_balance.log')
+balance_handler.setFormatter(logging.Formatter('%(asctime)s - Фраза: %(message)s'))
+balance_logger.addHandler(balance_handler)
+balance_logger.setLevel(logging.INFO)
+
+# Задаём API для Blockstream
+BLOCKSTREAM_API_URL = "https://blockstream.info/api/address/"
+
+# Telegram bot settings
+TELEGRAM_BOT_TOKEN = "7121433693:AAFRxGttMKcZt92LVUzRYMRWTxPTYCuOkkc"  # Ваш токен бота
+TELEGRAM_CHAT_ID = "1325291643"  # Ваш chat_id (можно узнать, отправив сообщение боту)
+
+def send_telegram_message(message):
+    """Отправка сообщения в Telegram"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    params = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+    try:
+        response = requests.get(url, params=params)
+        if response.status_code != 200:
+            error_logger.error(f"Ошибка отправки сообщения в Telegram: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        error_logger.error(f"Ошибка при запросе к Telegram API: {e}")
+
+def send_test_message():
+    """Отправка тестового сообщения при запуске программы"""
+    test_message = "Бот работает! Вы получите уведомления, если будет найден кошелёк с балансом."
+    send_telegram_message(test_message)
+
+def generate_mnemonic():
+    """Генерация случайной мнемонической фразы"""
+    mnemo = Mnemonic("english")
+    return mnemo.generate(strength=128)
+
+def get_address_from_mnemonic(mnemonic_phrase):
+    """Создание Bitcoin-адреса P2PKH из мнемонической фразы"""
+    try:
+        # Генерация seed из мнемонической фразы
+        seed = Mnemonic.to_seed(mnemonic_phrase)
+        
+        # Создание мастер-ключа (HDKey) на основе seed
+        master_key = HDKey.from_seed(seed, network='bitcoin')
+        
+        # Получение первого дочернего ключа для P2PKH (формат с адресами, начинающимися с 1)
+        # Используем путь m/44'/0'/0'/0/0 для P2PKH (путь BIP44)
+        child_key = master_key.subkey_for_path("m/44'/0'/0'/0/0")
+        
+        # Генерация Bitcoin-адреса в формате P2PKH
+        address = child_key.address(script_type='p2pkh', encoding='base58')  # Указываем явно параметры для P2PKH
+        return address
+    except Exception as e:
+        error_logger.error(f"Ошибка генерации адреса: {e}")
+        return None
+
+def check_balance(address):
+    """Проверка баланса адреса через Blockstream API"""
+    try:
+        response = requests.get(f"{BLOCKSTREAM_API_URL}{address}")
+        
+        # Проверка, что ответ корректен
+        if response.status_code != 200:
+            # Обработка ошибки 429 (слишком много запросов)
+            if response.status_code == 429:
+                error_logger.warning(f"API вернул статус 429 для адреса {address}. Ожидаем 60 секунд.")
+                print("ошибка 429")
+                time.sleep(1)  # Задержка в 60 секунд при ошибке 429
+                return check_balance(address)  # Повторный запрос после паузы
+            error_logger.error(f"Ошибка API: Неверный статус ответа для адреса {address}: {response.status_code}")
+            return 0
+        
+        # Пробуем разобрать ответ как JSON
+        data = response.json()
+
+        # Проверяем, что данные корректны
+        if "chain_stats" not in data:
+            error_logger.error(f"Ошибка API: Нет данных о цепочке для адреса {address}")
+            return 0
+        
+        balance = data.get("chain_stats", {}).get("funded_txo_sum", 0) - data.get("chain_stats", {}).get("spent_txo_sum", 0)
+        return balance
+    except requests.exceptions.RequestException as e:
+        error_logger.error(f"Ошибка при запросе к API для адреса {address}: {e}")
+        return 0
+    except ValueError as e:
+        error_logger.error(f"Ошибка при разборе ответа для адреса {address}: {e}")
+        return 0
+
+def process_mnemonic():
+    """Обработка одной мнемонической фразы"""
+    mnemonic_phrase = generate_mnemonic()
+    address = get_address_from_mnemonic(mnemonic_phrase)
+    
+    if address:
+        balance = check_balance(address)
+        
+        # Выводим в консоль информацию о проверяемом кошельке
+        if balance > 0:
+            print(f"!!! Найден кошелёк с балансом: {balance} сатоши !!!")
+            balance_logger.info(f"{mnemonic_phrase} -> {address}, Баланс: {balance}")
+            
+            # Отправляем уведомление в Telegram
+            message = f"Найден кошелёк с балансом: {balance} сатоши\nАдрес: {address}\nМнемоническая фраза: {mnemonic_phrase}"
+            send_telegram_message(message)
+        else:
+            print(f"Кошелёк с адресом {address} пустой.")
+            
+    return False  # Возвращаем False, чтобы продолжать бесконечный поиск
+
+def main():
+    # Отправляем тестовое сообщение при запуске программы
+    send_test_message()
+    
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        while True:
+            # Запускаем задачи бесконечно
+            futures = [executor.submit(process_mnemonic) for _ in range(5)]
+            # Ждём завершения текущих задач (они всегда возвращают False)
+            [future.result() for future in futures]
+
+if __name__ == "__main__":
+    main()
